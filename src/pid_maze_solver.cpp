@@ -88,9 +88,11 @@ private:
       double current_y = position.y;
       double current_yaw = yaw;
       for (auto &wp : wp_world_) {
-        current_x += wp.x;
-        current_y += wp.y;
         current_yaw = normalize_angle(current_yaw + wp.yaw);
+        current_x +=
+            wp.x * std::cos(current_yaw) - wp.y * std::sin(current_yaw);
+        current_y +=
+            wp.x * std::sin(current_yaw) + wp.y * std::cos(current_yaw);
 
         wp.x = current_x;
         wp.y = current_y;
@@ -106,29 +108,51 @@ private:
     const float angle_inc = msg->angle_increment;
     const size_t n = ranges.size();
 
-    min_front_dist_ = std::numeric_limits<double>::infinity();
-    min_left_dist_ = std::numeric_limits<double>::infinity();
-    min_right_dist_ = std::numeric_limits<double>::infinity();
+    // Temporary accumulators
+    double sum_f = 0, sum_b = 0, sum_l = 0, sum_r = 0;
+    int count_f = 0, count_b = 0, count_l = 0, count_r = 0;
 
     for (size_t i = 0; i < n; ++i) {
       float r = ranges[i];
+      // Filter out bad data and noise spikes
       if (std::isinf(r) || std::isnan(r)) {
         continue;
       }
+
       float angle = angle_min + i * angle_inc;
-      // Front: roughly -10° to +10°
-      if (std::abs(angle) < 0.1745) {
-        min_front_dist_ = std::min(min_front_dist_, static_cast<double>(r));
+      // Back
+      if (std::abs(angle) < 0.26) {
+        sum_b += r;
+        count_b++;
       }
-      // Left side: ~ +70° to +110°
-      else if (angle > 0.7853 && angle < 2.356) {
-        min_left_dist_ = std::min(min_left_dist_, static_cast<double>(r));
+      // Front
+      else if (std::abs(angle) > 2.88) {
+        sum_f += r;
+        count_f++;
       }
-      // Right side: ~ -105° to -75°
-      else if (angle < -0.7853 && angle > -2.356) {
-        min_right_dist_ = std::min(min_right_dist_, static_cast<double>(r));
+      // Right
+      else if (angle > 1.31 && angle < 1.83) {
+        sum_r += r;
+        count_r++;
+      }
+      // Left
+      else if (angle < -1.31 && angle > -1.83) {
+        sum_l += r;
+        count_l++;
       }
     }
+
+    // Compute means, falling back to infinity if no rays hit anything
+    mean_front_dist_ = (count_f > 0) ? (sum_f / count_f)
+                                     : std::numeric_limits<double>::infinity();
+    mean_back_dist_ = (count_b > 0) ? (sum_b / count_b)
+                                    : std::numeric_limits<double>::infinity();
+    mean_left_dist_ = (count_l > 0) ? (sum_l / count_l)
+                                    : std::numeric_limits<double>::infinity();
+    mean_right_dist_ = (count_r > 0) ? (sum_r / count_r)
+                                     : std::numeric_limits<double>::infinity();
+    // RCLCPP_INFO(get_logger(), "L:%.2f R:%.2f B:%.2f", mean_left_dist_,
+    //             mean_right_dist_, mean_back_dist_);
   }
 
   void motion_callback() {
@@ -172,19 +196,22 @@ private:
     // Compute velocity using PID controllers
     auto [vx, vy, wz] = get_vel_robot();
 
-    const double SAFE_DIST = 0.18;
-    if (min_front_dist_ < SAFE_DIST) {
+    const double SAFE_DIST = 0.2;
+    if (mean_front_dist_ < SAFE_DIST) {
       // Reverse a bit
-      vx -= 0.1;
+      vx = -0.1;
       vy = 0.0;
-    } else if (min_left_dist_ < SAFE_DIST) {
+      RCLCPP_INFO(get_logger(), "Too close on the front");
+    } else if (mean_left_dist_ < SAFE_DIST) {
       // Wall on left
       wz -= 0.1;
       vy -= 0.1;
-    } else if (min_right_dist_ < SAFE_DIST) {
+      RCLCPP_INFO(get_logger(), "Too close on the left");
+    } else if (mean_right_dist_ < SAFE_DIST) {
       // Wall on right
       wz += 0.1;
       vy += 0.1;
+      RCLCPP_INFO(get_logger(), "Too close on the right");
     }
 
     // limit final velocity
@@ -251,7 +278,7 @@ private:
 
   bool is_reached() const {
     auto [err_x, err_y, err_yaw] = get_err();
-    return std::hypot(err_x, err_y) < 0.05 && std::abs(err_yaw) < 0.08;
+    return std::hypot(err_x, err_y) < 0.05 && std::abs(err_yaw) < 0.1;
   }
 
   std::tuple<double, double, double> get_err() const {
@@ -324,13 +351,13 @@ private:
   }
 
   std::vector<Waypoint> get_sim_wp() const {
-    return {{0.35, 0.0, 0.0},    {0.0, 0.0, -0.7853}, {0.2, -0.2, 0.0},
-            {0.0, 0.0, -0.7853}, {0.0, -1.2, 0.0},    {0.0, 0.0, 1.5707},
-            {0.5, 0.0, 0.0},     {0.0, 0.0, 1.5707},  {0.0, 0.6, 0.0},
-            {0.45, 0.0, 0.0},    {0.0, 0.5, 0.0},     {0.55, 0.0, 0.0},
-            {0.0, 0.9, 0.0},     {0.0, 0.0, 1.5707},  {-0.5, 0.0, 0.0},
-            {0.0, -0.35, 0.0},   {-0.5, 0.0, 0.0},    {0.0, 0.0, -0.7853},
-            {-0.3, 0.3, 0.0},    {0.0, 0.0, 0.7853},  {-0.6, 0.0, 0.0},
+    return {{0.35, 0.0, 0.0},    {0.0, 0.0, -0.7853}, {0.25, 0.0, 0.0},
+            {0.0, 0.0, -0.7853}, {1.2, 0.0, 0.0},     {0.0, 0.0, 1.5707},
+            {0.53, 0.0, 0.0},    {0.0, 0.0, 1.5707},  {0.55, 0.0, 0.0},
+            {0.0, -0.43, 0.0},   {0.55, 0.0, 0.0},    {0.0, -0.5, 0.0},
+            {0.85, 0.0, 0.0},    {0.0, 0.0, 1.5707},  {0.5, 0.0, 0.0},
+            {0.0, 0.33, 0.0},    {0.5, 0.0, 0.0},     {0.0, 0.0, -0.7853},
+            {0.45, 0.0, 0.0},    {0.0, 0.0, 0.7853},  {0.5, 0.0, 0.0},
             {0.0, 0.0, 3.1415}};
   }
 
@@ -366,9 +393,10 @@ private:
   rclcpp::Subscription<LaserScan>::SharedPtr scan_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
-  double min_front_dist_ = std::numeric_limits<double>::infinity();
-  double min_left_dist_ = std::numeric_limits<double>::infinity();
-  double min_right_dist_ = std::numeric_limits<double>::infinity();
+  double mean_front_dist_ = std::numeric_limits<double>::infinity();
+  double mean_left_dist_ = std::numeric_limits<double>::infinity();
+  double mean_right_dist_ = std::numeric_limits<double>::infinity();
+  double mean_back_dist_ = std::numeric_limits<double>::infinity();
 
   rclcpp::Time last_odom_time_;
   double odom_timeout_{0.5}; // in second
