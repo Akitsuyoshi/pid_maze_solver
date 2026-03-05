@@ -4,7 +4,6 @@
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/time.hpp"
-#include "sensor_msgs/msg/detail/laser_scan__struct.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
@@ -41,6 +40,7 @@ class PidMazeSolver : public rclcpp::Node {
 
   enum class State {
     BOOTSTRAP, // wait for odom
+    ALIGNING,  // square up with the wall with laserScan
     TRACKING,  // drive to target position
     WAITING,   // wait between track and advance
     ADVANCING, // load next waypoint
@@ -84,21 +84,8 @@ private:
 
     update_position(position.x, position.y, yaw);
     if (state_ == State::BOOTSTRAP) {
-      double current_x = position.x;
-      double current_y = position.y;
-      double current_yaw = yaw;
-      for (auto &wp : wp_world_) {
-        current_yaw = normalize_angle(current_yaw + wp.yaw);
-        current_x +=
-            wp.x * std::cos(current_yaw) - wp.y * std::sin(current_yaw);
-        current_y +=
-            wp.x * std::sin(current_yaw) + wp.y * std::cos(current_yaw);
-
-        wp.x = current_x;
-        wp.y = current_y;
-        wp.yaw = current_yaw;
-      }
-      start_track();
+      RCLCPP_INFO(get_logger(), "Starting to align the robot.");
+      state_ = State::ALIGNING;
     }
   }
 
@@ -121,12 +108,12 @@ private:
 
       float angle = angle_min + i * angle_inc;
       // Back
-      if (std::abs(angle) < 0.26) {
+      if (std::abs(angle) < 0.1745) {
         sum_b += r;
         count_b++;
       }
       // Front
-      else if (std::abs(angle) > 2.88) {
+      else if (std::abs(angle) > 2.967) {
         sum_f += r;
         count_f++;
       }
@@ -160,6 +147,9 @@ private:
     case State::BOOTSTRAP:
       stop_robot();
       break;
+    case State::ALIGNING:
+      move_to_starting_point();
+      break;
     case State::TRACKING:
       move_robot();
       break;
@@ -180,6 +170,27 @@ private:
 
   void stop_robot() const { publish_vel(0.0, 0.0, 0.0); }
 
+  void move_to_starting_point() {
+    // This is a relative movement to get to the ideal starting point
+    if (std::isinf(mean_left_dist_) || std::isinf(mean_right_dist_) ||
+        std::isinf(mean_back_dist_)) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Waiting to get scan data");
+      return;
+    }
+
+    RCLCPP_INFO(get_logger(), "Calculating initial alignment waypoint...");
+
+    double dist_to_center_y = (mean_left_dist_ - mean_right_dist_) / 2.0;
+    double dist_to_start_x =
+        0.2 - mean_back_dist_; // If we're at 0.1, move +0.25 forward
+
+    Waypoint start_alignment_wp = {dist_to_start_x, dist_to_center_y, 0.0};
+    wp_world_.insert(wp_world_.begin(), start_alignment_wp);
+    transform_world_wp_absolute();
+    start_track();
+  }
+
   void move_robot() {
     if (is_reached()) {
       stop_robot();
@@ -196,28 +207,32 @@ private:
     // Compute velocity using PID controllers
     auto [vx, vy, wz] = get_vel_robot();
 
+    // Nudge function for wall avoidance
     const double SAFE_DIST = 0.2;
+    const double AVOID_P = 0.5;
     if (mean_front_dist_ < SAFE_DIST) {
       // Reverse a bit
-      vx = -0.1;
+      vx -= AVOID_P * (SAFE_DIST - mean_front_dist_);
       vy = 0.0;
       RCLCPP_INFO(get_logger(), "Too close on the front");
     } else if (mean_left_dist_ < SAFE_DIST) {
       // Wall on left
-      wz -= 0.1;
-      vy -= 0.1;
+      double err = AVOID_P * (SAFE_DIST - mean_left_dist_);
+      wz -= err;
+      vy -= err;
       RCLCPP_INFO(get_logger(), "Too close on the left");
     } else if (mean_right_dist_ < SAFE_DIST) {
       // Wall on right
-      wz += 0.1;
-      vy += 0.1;
+      double err = AVOID_P * (SAFE_DIST - mean_right_dist_);
+      wz += err;
+      vy += err;
       RCLCPP_INFO(get_logger(), "Too close on the right");
     }
 
     // limit final velocity
-    vx = std::clamp(vx, -0.5, 0.5);
-    vy = std::clamp(vy, -0.5, 0.5);
-    wz = std::clamp(wz, -1.0, 1.0);
+    vx = std::clamp(vx, -0.3, 0.3);
+    vy = std::clamp(vy, -0.3, 0.3);
+    wz = std::clamp(wz, -0.9, 0.9);
 
     publish_vel(vx, vy, wz);
   }
@@ -362,8 +377,30 @@ private:
   }
 
   std::vector<Waypoint> get_real_wp() const {
-    return {
-        {0.9, 0.0, 0.0}, {0.0, -0.6, 0.0}, {0.0, 0.6, 0.0}, {-0.9, 0.0, 0.0}};
+    return {{0.9, 0.0, 0.0},     {0.8, 0.0, 0.0},     {0.0, 0.0, -1.5707},
+            {0.55, 0.0, 0.0},    {0.0, -0.45, 0.0},   {0.55, 0.0, 0.0},
+            {0.0, 0.5, 0.0},     {0.525, 0.0, 0.0},   {0.0, -0.5, 0.0},
+            {0.4, 0.0, 0.0},     {0.0, 0.0, -1.5707}, {0.5, 0.0, 0.0},
+            {0.0, 0.0, -1.5707}, {0.9, 0.0, 0.0},     {0.0, 0.0, 1.5707},
+            {0.575, 0.0, 0.0},   {0.0, 0.0, -1.5707}, {0.55, 0.0, 0.0},
+            {0.0, 0.0, 1.5707},  {0.35, 0.0, 0.0},    {0.0, 0.0, 3.1415}};
+  }
+
+  void transform_world_wp_absolute() {
+    // The world waypoints are transformed to absolute when the node received
+    // robot init pose for the first time.
+    double current_x = x_;
+    double current_y = y_;
+    double current_yaw = yaw_;
+    for (auto &wp : wp_world_) {
+      current_yaw = normalize_angle(current_yaw + wp.yaw);
+      current_x += wp.x * std::cos(current_yaw) - wp.y * std::sin(current_yaw);
+      current_y += wp.x * std::sin(current_yaw) + wp.y * std::cos(current_yaw);
+
+      wp.x = current_x;
+      wp.y = current_y;
+      wp.yaw = current_yaw;
+    }
   }
 
   void set_param() {
@@ -379,8 +416,8 @@ private:
                       declare_parameter<double>("pid_yaw.ki", 0.0),
                       declare_parameter<double>("pid_yaw.kd", 0.1));
 
-    double max_v = declare_parameter<double>("max_v", 0.5);
-    double max_w = declare_parameter<double>("max_w", 1.0);
+    double max_v = declare_parameter<double>("max_v", 0.3);
+    double max_w = declare_parameter<double>("max_w", 0.9);
     pid_x_.set_limit(max_v, 5.0);
     pid_y_.set_limit(max_v, 5.0);
     pid_yaw_.set_limit(max_w, 5.0);
