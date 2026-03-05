@@ -13,13 +13,26 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(distance_controller REQUIRED)
+find_package(ament_index_cpp REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 add_executable(pid_maze_solver src/pid_maze_solver.cpp)
-ament_target_dependencies(pid_maze_solver rclcpp nav_msgs tf2 geometry_msgs distance_controller sensor_msgs)
+ament_target_dependencies(pid_maze_solver rclcpp nav_msgs tf2 geometry_msgs distance_controller sensor_msgs ament_index_cpp yaml-cpp)
+target_link_libraries(pid_maze_solver
+	yaml-cpp
+)
+
 
 INSTALL(TARGETS
 	pid_maze_solver
 	DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY
+    waypoints
+  DESTINATION
+    share/${PROJECT_NAME}/
 )
 
 if(BUILD_TESTING)

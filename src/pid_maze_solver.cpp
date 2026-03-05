@@ -1,3 +1,4 @@
+#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "distance_controller/pid.hpp"
 #include "geometry_msgs/msg/twist.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -8,9 +9,11 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/LinearMath/Vector3.h"
+#include "yaml-cpp/yaml.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <fstream>
 #include <limits>
 #include <tuple>
 #include <vector>
@@ -50,7 +53,8 @@ class PidMazeSolver : public rclcpp::Node {
 
 public:
   PidMazeSolver(int scene_num)
-      : Node("pid_maze_solver"), scene_num_(scene_num), wp_world_(get_wp()) {
+      : Node("pid_maze_solver"), scene_num_(scene_num),
+        wp_world_(get_wp_from_yaml()) {
     RCLCPP_INFO(get_logger(), "Initializing node...");
 
     pub_ = create_publisher<Twist>("/cmd_vel", 10);
@@ -183,7 +187,7 @@ private:
 
     double dist_to_center_y = (mean_left_dist_ - mean_right_dist_) / 2.0;
     double dist_to_start_x =
-        0.2 - mean_back_dist_; // If we're at 0.1, move +0.25 forward
+        0.35 - mean_back_dist_; // If we're at 0.1, move +0.25 forward
 
     Waypoint start_alignment_wp = {dist_to_start_x, dist_to_center_y, 0.0};
     wp_world_.insert(wp_world_.begin(), start_alignment_wp);
@@ -213,20 +217,23 @@ private:
     if (mean_front_dist_ < SAFE_DIST) {
       // Reverse a bit
       vx -= AVOID_P * (SAFE_DIST - mean_front_dist_);
-      vy = 0.0;
-      RCLCPP_INFO(get_logger(), "Too close on the front");
+      //   vy = 0.0;
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Too close on the front");
     } else if (mean_left_dist_ < SAFE_DIST) {
       // Wall on left
       double err = AVOID_P * (SAFE_DIST - mean_left_dist_);
       wz -= err;
       vy -= err;
-      RCLCPP_INFO(get_logger(), "Too close on the left");
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Too close on the left");
     } else if (mean_right_dist_ < SAFE_DIST) {
       // Wall on right
       double err = AVOID_P * (SAFE_DIST - mean_right_dist_);
       wz += err;
       vy += err;
-      RCLCPP_INFO(get_logger(), "Too close on the right");
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Too close on the right");
     }
 
     // limit final velocity
@@ -352,38 +359,39 @@ private:
     pub_->publish(cmd);
   }
 
-  std::vector<Waypoint> get_wp() const {
+  std::vector<Waypoint> get_wp_from_yaml() const {
     // Waypoints are defined in relative world frame (x, y, yaw)
-    switch (scene_num_) {
-    case 1: // For simulation
-      return get_sim_wp();
-    case 2: // For real cyber world
-      return get_real_wp();
-    default:
-      RCLCPP_ERROR(get_logger(), "Undefined scene number %d", scene_num_);
-      return {{0.0, 0.0, 0.0}};
+    std::vector<Waypoint> wps;
+    std::string pkg_share_directory =
+        ament_index_cpp::get_package_share_directory("pid_maze_solver");
+
+    std::string wp_file_name =
+        (scene_num_ == 1) ? "waypoints_sim.yaml" : "waypoints_real.yaml";
+    std::string yaml_file_path =
+        pkg_share_directory + "/waypoints/" + wp_file_name;
+
+    try {
+      YAML::Node config = YAML::LoadFile(yaml_file_path);
+      if (config["waypoints"] && config["waypoints"].IsSequence()) {
+        for (const auto &node : config["waypoints"]) {
+          if (node["x"] && node["y"] && node["yaw"]) {
+            Waypoint wp;
+            wp.x = node["x"].as<double>();
+            wp.y = node["y"].as<double>();
+            wp.yaw = node["yaw"].as<double>();
+            wps.push_back(wp);
+          } else {
+            RCLCPP_WARN(get_logger(),
+                        "Malformed waypoint detected. Skipping...");
+          }
+        }
+      }
+    } catch (const YAML::Exception &e) {
+      RCLCPP_ERROR(get_logger(), "YAML Load Error: %s", e.what());
     }
-  }
-
-  std::vector<Waypoint> get_sim_wp() const {
-    return {{0.35, 0.0, 0.0},    {0.0, 0.0, -0.7853}, {0.25, 0.0, 0.0},
-            {0.0, 0.0, -0.7853}, {1.2, 0.0, 0.0},     {0.0, 0.0, 1.5707},
-            {0.53, 0.0, 0.0},    {0.0, 0.0, 1.5707},  {0.55, 0.0, 0.0},
-            {0.0, -0.43, 0.0},   {0.55, 0.0, 0.0},    {0.0, -0.5, 0.0},
-            {0.85, 0.0, 0.0},    {0.0, 0.0, 1.5707},  {0.5, 0.0, 0.0},
-            {0.0, 0.33, 0.0},    {0.5, 0.0, 0.0},     {0.0, 0.0, -0.7853},
-            {0.45, 0.0, 0.0},    {0.0, 0.0, 0.7853},  {0.5, 0.0, 0.0},
-            {0.0, 0.0, 3.1415}};
-  }
-
-  std::vector<Waypoint> get_real_wp() const {
-    return {{0.9, 0.0, 0.0},     {0.8, 0.0, 0.0},     {0.0, 0.0, -1.5707},
-            {0.55, 0.0, 0.0},    {0.0, -0.45, 0.0},   {0.55, 0.0, 0.0},
-            {0.0, 0.5, 0.0},     {0.525, 0.0, 0.0},   {0.0, -0.5, 0.0},
-            {0.4, 0.0, 0.0},     {0.0, 0.0, -1.5707}, {0.5, 0.0, 0.0},
-            {0.0, 0.0, -1.5707}, {0.9, 0.0, 0.0},     {0.0, 0.0, 1.5707},
-            {0.575, 0.0, 0.0},   {0.0, 0.0, -1.5707}, {0.55, 0.0, 0.0},
-            {0.0, 0.0, 1.5707},  {0.35, 0.0, 0.0},    {0.0, 0.0, 3.1415}};
+    RCLCPP_INFO(get_logger(), "Successfully loaded %zu waypoints from %s",
+                wps.size(), yaml_file_path.c_str());
+    return wps;
   }
 
   void transform_world_wp_absolute() {
